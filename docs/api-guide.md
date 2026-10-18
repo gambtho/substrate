@@ -292,7 +292,7 @@ Each entry in `containers` may declare an optional **HTTP wakeup probe** so `Res
 
 How it behaves:
 
-- **When it runs.** On every `ResumeActor` that actually wakes the actor. A `ResumeActor` on an actor that is already `RUNNING` is a no-op and does not probe.
+- **When it runs.** On every `ResumeActor` that actually wakes the actor. A `ResumeActor` without `expected` on an actor that is already `RUNNING` is a no-op and does not probe.
 - **Block-until-ready semantics.** `ResumeActor` returns successfully only after every container with a `wakeupProbe` has returned HTTP 200. If any container has not done so within `timeoutSeconds` (30s by default), `ResumeActor` fails and the actor moves to `ACTOR_STATE_CRASHED`, as it does for any other error while waking. A crashed actor cannot be resumed directly: `ResumeActor` rejects it with `FAILED_PRECONDITION`. Call `RevertActor` first, which returns it to `ACTOR_STATE_SUSPENDED` with its last snapshot, then resume it again.
 - **Aggressive polling.** The poll loop is tuned for single-millisecond detection latency: a keep-alive HTTP client with a 1ms interval and 250ms per-request timeout. While the workload is still booting, kernel `RST`s return in microseconds, so the loop spends almost no time blocked; once the listener is up, the next attempt completes on veth-local latency.
 - **Golden snapshot warm-up shortcut.** When **every** container in a template declares `wakeupProbe`, the actor template controller skips its default ~20s "give the workload time to settle" delay before taking the golden snapshot — `ResumeActor` already blocked until the workload reported 200, so the workload is known to be initialized. Templates that omit `wakeupProbe` on any container keep the 20s warm-up as a safety net.
@@ -332,6 +332,19 @@ resources:
 snapshotConfig:
   storageLocation: gs://my-bucket/secret-agent
 ```
+
+### Conditional Resume
+
+To resume a checkpoint recorded by a client, set `ResumeActorRequest.expected` with
+`actorUid`, `snapshotUuid`, and `generation` from the observed actor and snapshot.
+The server checks these under the actor lifecycle lease before restore work.
+The actor must be `SUSPENDED` or retryable `RESUMING`, and its newest held snapshot
+and actual local-first restore source must match. The durable copy must be
+`COMPLETED`, even if a local copy exists. A matching pending upload returns
+`UNAVAILABLE`; a mismatched actor or checkpoint, an invalid state (including
+`RUNNING`), or a template reference changed during an assignment retry returns
+`FAILED_PRECONDITION`. The condition does not select an older checkpoint or change
+restore fidelity. Omit `expected` to retain unconditional resume behavior.
 
 ### Snapshot Storage Layout
 

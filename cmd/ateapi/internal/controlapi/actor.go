@@ -467,7 +467,7 @@ func (s *RPCService) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorR
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
-	actor, resumed, err := s.actorWorkflow.ResumeActor(ctx, actorRef)
+	actor, resumed, err := s.actorWorkflow.ResumeActor(ctx, actorRef, req.GetExpected())
 	if err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
 			return nil, apierror.Aborted("concurrent update conflict, please retry")

@@ -897,7 +897,7 @@ func TestCreateActor_GoldenTagDefault(t *testing.T) {
 				}
 			}
 			workflow := &ActorWorkflow{store: persistence}
-			_, _, src, err := workflow.loadActorForResume(ctx, resources.ActorRefFromActor(created))
+			_, _, src, err := workflow.loadActorForResume(ctx, resources.ActorRefFromActor(created), nil)
 			if err != nil {
 				t.Fatal(err)
 			}

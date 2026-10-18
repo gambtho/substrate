@@ -69,7 +69,7 @@ type restoreTelemetry struct {
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent:
 // a re-entered workflow fast-forwards past the steps a previous attempt
 // completed, deriving progress from the persisted actor alone.
-func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, resumed bool, err error) {
+func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef, expected *ateapipb.ExpectedSnapshot) (_ *ateapipb.Actor, resumed bool, err error) {
 	ctx = preview.ContextWithOptIn(ctx)
 	start := time.Now()
 	var actor *ateapipb.Actor
@@ -97,7 +97,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	if err != nil {
 		return nil, false, err
 	}
-	if wasRunning = actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING; wasRunning {
+	if wasRunning = actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING; wasRunning && expected == nil {
 		return actor, false, nil
 	}
 
@@ -108,7 +108,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	defer lease.Close()
 
 	var src resumeSnapshotSource
-	actor, actorTemplate, src, err = w.loadActorForResume(leaseCtx, actorRef)
+	actor, actorTemplate, src, err = w.loadActorForResume(leaseCtx, actorRef, expected)
 	if err != nil {
 		return nil, false, err
 	}
@@ -122,7 +122,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	actor = created
 	var worker *ateapipb.Worker
 	var assigned *ateapipb.Actor
-	if assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate); err != nil {
+	if assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate, expected); err != nil {
 		return nil, false, err
 	}
 	actor = assigned
@@ -143,7 +143,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 
 // loadActorForResume fetches the current actor record and its template, and
 // resolves the boot source for the pending restore.
-func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, _ resumeSnapshotSource, err error) {
+func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resources.ActorRef, expected *ateapipb.ExpectedSnapshot) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, _ resumeSnapshotSource, err error) {
 	ctx, done := stepSpan(ctx, "LoadActorForResume")
 	defer func() { err = done(err) }()
 
@@ -154,6 +154,10 @@ func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resourc
 			return nil, nil, src, apierror.NotFound("Actor %s not found", actorRef)
 		}
 		return nil, nil, src, fmt.Errorf("while getting actor from DB: %w", err)
+	}
+
+	if err := validateExpectedSnapshot(actor, expected); err != nil {
+		return nil, nil, src, err
 	}
 
 	// If the actor is already running, there is no pending restore to prepare
@@ -181,6 +185,42 @@ func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resourc
 	}
 
 	return actor, actorTemplate, src, nil
+}
+
+// validateExpectedSnapshot checks the held checkpoint and the local-first
+// restore source, not last_assigned_generation: revert can discard generations.
+// Call only with an actor read under the lifecycle lease, including refreshes
+// after assignment conflicts, before doing further workload work.
+func validateExpectedSnapshot(actor *ateapipb.Actor, expected *ateapipb.ExpectedSnapshot) error {
+	if expected == nil {
+		return nil
+	}
+	if actor.GetMetadata().GetUid() != expected.GetActorUid() {
+		return apierror.FailedPrecondition("actor incarnation does not match expected snapshot")
+	}
+	switch actor.GetStatus().GetState() {
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ateapipb.ActorState_ACTOR_STATE_RESUMING:
+	default:
+		return apierror.FailedPrecondition("actor in state %s cannot resume an expected snapshot", actor.GetStatus().GetState())
+	}
+	latest := latestSnapshot(actor.GetStatus(), func(*ateapipb.Snapshot) bool { return true })
+	if latest == nil || latest.GetUuid() != expected.GetSnapshotUuid() || latest.GetGeneration() != expected.GetGeneration() {
+		return apierror.FailedPrecondition("actor's newest held snapshot does not match expected snapshot")
+	}
+	switch latest.GetDurableSnapshot().GetStatus() {
+	case ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING:
+		return apierror.Unavailable("expected snapshot is not yet complete in durable storage")
+	case ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED:
+	default:
+		return apierror.FailedPrecondition("expected snapshot has no completed durable checkpoint")
+	}
+	// Restore uses a local checkpoint whenever one exists, even if a newer
+	// durable snapshot is held. A condition must describe what will be restored.
+	if local := findLatestLocalSnapshot(actor.GetStatus()); local != nil &&
+		(local.GetUuid() != expected.GetSnapshotUuid() || local.GetGeneration() != expected.GetGeneration()) {
+		return apierror.FailedPrecondition("actor's local restore source does not match expected snapshot")
+	}
+	return nil
 }
 
 // ensureVolumesCreated provisions any actor volumes that have no storage
@@ -239,7 +279,7 @@ func (w *ActorWorkflow) ensureVolumesCreated(ctx context.Context, actorRef resou
 // assignment. A version conflict there is retried under a bounded backoff
 // only after re-reading the actor and revalidating it can still be resumed —
 // the conflicting writer may have crashed, drained, or deleted it.
-func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
+func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, expected *ateapipb.ExpectedSnapshot) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	ctx, done := stepSpan(ctx, "AssignWorker")
 	defer func() { err = done(err) }()
 
@@ -273,7 +313,7 @@ func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resou
 			return false, err
 		}
 		attemptStart := time.Now()
-		attemptActor, attemptWorker, attemptErr := w.assignWorkerAttempt(ctx, actorRef, actor, actorTemplate)
+		attemptActor, attemptWorker, attemptErr := w.assignWorkerAttempt(ctx, actorRef, actor, actorTemplate, expected)
 		lastAttempt = time.Since(attemptStart)
 		attempted = true
 		if attemptErr == nil {
@@ -461,7 +501,7 @@ func schedulerRecordable(err error) bool {
 // re-reads the actor: if the fresh copy can still be resumed the refreshed
 // actor is returned along with the conflict so the caller retries with clean
 // inputs; any other status aborts the resume.
-func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
+func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, expected *ateapipb.ExpectedSnapshot) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	start := time.Now()
 	outcome := ateattr.SchedulerOutcomeError
 	poolNamespace := ""
@@ -560,6 +600,15 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		if gerr != nil {
 			slog.WarnContext(ctx, "Failed to refresh actor after assignment conflict", slog.Any("err", gerr))
 			return nil, nil, err
+		}
+		if err := validateExpectedSnapshot(fresh, expected); err != nil {
+			return nil, nil, err
+		}
+		if expected != nil && (fresh.GetActorTemplate().GetAtespace() != actor.GetActorTemplate().GetAtespace() ||
+			fresh.GetActorTemplate().GetName() != actor.GetActorTemplate().GetName()) {
+			// The template and restore source were resolved before assignment.
+			// Do not mix a refreshed reference with that original template.
+			return nil, nil, apierror.FailedPrecondition("actor template changed during conditioned resume")
 		}
 		switch fresh.GetStatus().GetState() {
 		case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
